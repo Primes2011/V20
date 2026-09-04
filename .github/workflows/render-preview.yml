@@ -1,0 +1,136 @@
+name: Render V20 Preview
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/render-preview.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  render-preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install virtual display and graphics dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip xvfb xdotool imagemagick mesa-vulkan-drivers libgl1-mesa-dri vulkan-tools
+
+      - name: Extract Lexicon Frontier V20
+        run: |
+          mkdir -p build
+          unzip -q Lexicon_Frontier_REALWORLD_V20.zip -d build
+          PROJECT_FILE="$(find build -name project.godot -print -quit)"
+          if [ -z "$PROJECT_FILE" ]; then
+            echo "project.godot not found"
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "$PROJECT_FILE")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project directory: $PROJECT_DIR"
+
+      - name: Install Godot 4.7.2
+        run: |
+          curl -L --fail --retry 3             -o godot.zip             "https://github.com/godotengine/godot-builds/releases/download/4.7.2-stable/Godot_v4.7.2-stable_linux.x86_64.zip"
+          unzip -q godot.zip
+          chmod +x Godot_v4.7.2-stable_linux.x86_64
+          sudo mv Godot_v4.7.2-stable_linux.x86_64 /usr/local/bin/godot
+          godot --version
+
+      - name: Launch V20 and capture real rendered frames
+        shell: bash
+        run: |
+          set -u
+          mkdir -p render_preview
+
+          export DISPLAY=:99
+          export GODOT_AUDIO_DRIVER=Dummy
+          Xvfb :99 -screen 0 1280x720x24 -nolisten tcp >render_preview/xvfb.log 2>&1 &
+          XVFB_PID=$!
+          sleep 2
+
+          vulkaninfo --summary > render_preview/vulkan.txt 2>&1 || true
+
+          godot --path "$PROJECT_DIR" --resolution 1280x720 --windowed             >render_preview/godot.log 2>&1 &
+          GODOT_PID=$!
+
+          WIN=""
+          for i in $(seq 1 60); do
+            WIN="$(xdotool search --name "Lexicon Frontier" 2>/dev/null | head -n 1 || true)"
+            if [ -n "$WIN" ]; then
+              break
+            fi
+            if ! kill -0 "$GODOT_PID" 2>/dev/null; then
+              echo "Godot exited before opening a window."
+              break
+            fi
+            sleep 1
+          done
+
+          if [ -n "$WIN" ]; then
+            xdotool windowmove "$WIN" 0 0 || true
+            xdotool windowsize "$WIN" 1280 720 || true
+            xdotool windowactivate "$WIN" || true
+            sleep 2
+
+            import -window "$WIN" render_preview/00_intro.png || true
+
+            # The deploy button is near the lower-left quadrant of the 1280x720 window.
+            xdotool mousemove --window "$WIN" 325 510 click 1 || true
+            sleep 8
+            import -window "$WIN" render_preview/01_spawn.png || true
+
+            # Rotate the actual first-person camera.
+            xdotool windowactivate "$WIN" || true
+            xdotool mousemove 640 360 || true
+            xdotool mousemove_relative --sync -- 260 -70 || true
+            sleep 2
+            import -window "$WIN" render_preview/02_look_right.png || true
+
+            # Walk forward into the environment.
+            xdotool keydown w
+            sleep 3
+            xdotool keyup w
+            sleep 2
+            import -window "$WIN" render_preview/03_forward.png || true
+
+            # Turn left and capture another player-eye-level view.
+            xdotool mousemove_relative --sync -- -420 45 || true
+            sleep 2
+            import -window "$WIN" render_preview/04_look_left.png || true
+
+            # Move diagonally for a final composition.
+            xdotool keydown w
+            xdotool keydown d
+            sleep 2
+            xdotool keyup d
+            xdotool keyup w
+            sleep 2
+            import -window "$WIN" render_preview/05_environment.png || true
+          else
+            echo "No Godot window was found." | tee render_preview/no_window.txt
+          fi
+
+          kill "$GODOT_PID" 2>/dev/null || true
+          kill "$XVFB_PID" 2>/dev/null || true
+          wait "$GODOT_PID" 2>/dev/null || true
+          wait "$XVFB_PID" 2>/dev/null || true
+
+          echo "Captured files:"
+          ls -lah render_preview
+
+      - name: Upload rendered preview frames and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lexicon-v20-render-preview
+          path: render_preview/
+          if-no-files-found: warn
+          retention-days: 7
