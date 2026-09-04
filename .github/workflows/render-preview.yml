@@ -12,7 +12,7 @@ permissions:
 jobs:
   render-preview:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repository
@@ -25,7 +25,7 @@ jobs:
 
       - name: Extract Lexicon Frontier V20
         run: |
-          mkdir -p build
+          mkdir -p build render_preview
           unzip -q Lexicon_Frontier_REALWORLD_V20.zip -d build
           PROJECT_FILE="$(find build -name project.godot -print -quit)"
           if [ -z "$PROJECT_FILE" ]; then
@@ -36,6 +36,11 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "Project directory: $PROJECT_DIR"
 
+          # Fresh Godot checkouts don't have the editor global-class cache yet.
+          # The V20 game declares RealWorldBuilder through a preload, so this
+          # preview-only patch removes the redundant hard type annotation.
+          sed -i 's/var real_world: RealWorldBuilder/var real_world/' "$PROJECT_DIR/scripts/main.gd"
+
       - name: Install Godot 4.7.2
         run: |
           curl -L --fail --retry 3             -o godot.zip             "https://github.com/godotengine/godot-builds/releases/download/4.7.2-stable/Godot_v4.7.2-stable_linux.x86_64.zip"
@@ -44,25 +49,31 @@ jobs:
           sudo mv Godot_v4.7.2-stable_linux.x86_64 /usr/local/bin/godot
           godot --version
 
+      - name: Import all Godot resources first
+        run: |
+          godot --headless --path "$PROJECT_DIR" --import             > render_preview/import.log 2>&1 || {
+              cat render_preview/import.log
+              exit 1
+            }
+          tail -n 120 render_preview/import.log || true
+
       - name: Launch V20 and capture real rendered frames
         shell: bash
         run: |
           set -u
-          mkdir -p render_preview
 
           export DISPLAY=:99
-          export GODOT_AUDIO_DRIVER=Dummy
-          Xvfb :99 -screen 0 1280x720x24 -nolisten tcp >render_preview/xvfb.log 2>&1 &
+          Xvfb :99 -screen 0 1600x900x24 -nolisten tcp >render_preview/xvfb.log 2>&1 &
           XVFB_PID=$!
           sleep 2
 
           vulkaninfo --summary > render_preview/vulkan.txt 2>&1 || true
 
-          godot --path "$PROJECT_DIR" --resolution 1280x720 --windowed             >render_preview/godot.log 2>&1 &
+          godot --path "$PROJECT_DIR" --resolution 1600x900 --windowed             >render_preview/godot.log 2>&1 &
           GODOT_PID=$!
 
           WIN=""
-          for i in $(seq 1 60); do
+          for i in $(seq 1 90); do
             WIN="$(xdotool search --name "Lexicon Frontier" 2>/dev/null | head -n 1 || true)"
             if [ -n "$WIN" ]; then
               break
@@ -76,43 +87,41 @@ jobs:
 
           if [ -n "$WIN" ]; then
             xdotool windowmove "$WIN" 0 0 || true
-            xdotool windowsize "$WIN" 1280 720 || true
+            xdotool windowsize "$WIN" 1600 900 || true
             xdotool windowactivate "$WIN" || true
-            sleep 2
+            sleep 5
 
             import -window "$WIN" render_preview/00_intro.png || true
 
-            # The deploy button is near the lower-left quadrant of the 1280x720 window.
-            xdotool mousemove --window "$WIN" 325 510 click 1 || true
-            sleep 8
+            # V20's ENTER THE HIGHLANDS button is at x=240..570, y=600..664.
+            xdotool mousemove --window "$WIN" 405 632 click 1 || true
+
+            # Procedural world generation is intentionally heavy on llvmpipe.
+            sleep 20
             import -window "$WIN" render_preview/01_spawn.png || true
 
-            # Rotate the actual first-person camera.
             xdotool windowactivate "$WIN" || true
-            xdotool mousemove 640 360 || true
+            xdotool mousemove 800 450 || true
             xdotool mousemove_relative --sync -- 260 -70 || true
-            sleep 2
+            sleep 3
             import -window "$WIN" render_preview/02_look_right.png || true
 
-            # Walk forward into the environment.
             xdotool keydown w
-            sleep 3
+            sleep 4
             xdotool keyup w
-            sleep 2
+            sleep 3
             import -window "$WIN" render_preview/03_forward.png || true
 
-            # Turn left and capture another player-eye-level view.
             xdotool mousemove_relative --sync -- -420 45 || true
-            sleep 2
+            sleep 3
             import -window "$WIN" render_preview/04_look_left.png || true
 
-            # Move diagonally for a final composition.
             xdotool keydown w
             xdotool keydown d
-            sleep 2
+            sleep 3
             xdotool keyup d
             xdotool keyup w
-            sleep 2
+            sleep 3
             import -window "$WIN" render_preview/05_environment.png || true
           else
             echo "No Godot window was found." | tee render_preview/no_window.txt
@@ -125,6 +134,9 @@ jobs:
 
           echo "Captured files:"
           ls -lah render_preview
+
+          echo "--- Godot log tail ---"
+          tail -n 180 render_preview/godot.log || true
 
       - name: Upload rendered preview frames and logs
         if: always()
